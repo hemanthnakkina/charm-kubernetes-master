@@ -166,6 +166,22 @@ def channel_changed():
     set_upgrade_needed()
 
 
+# Returns True if a is subnet of b
+# This method is copied from cpython as it is available only from
+# python 3.7
+# https://github.com/python/cpython/blob/3.7/Lib/ipaddress.py#L1000
+def is_subnet_of(a, b):
+    try:
+        # Always false if one is v4 and the other is v6.
+        if a._version != b._version:
+            raise TypeError(f"{a} and {b} are not of the same version")
+        return (b.network_address <= a.network_address and
+                b.broadcast_address >= a.broadcast_address)
+    except AttributeError:
+        raise TypeError(f"Unable to test subnet containment "
+                        f"between {a} and {b}")
+
+
 def service_cidr():
     ''' Return the charm's service-cidr config '''
     frozen_cidr = db.get('kubernetes-master.service-cidr')
@@ -173,9 +189,21 @@ def service_cidr():
 
 
 def freeze_service_cidr():
-    ''' Freeze the service CIDR. Once the apiserver has started, we can no
-    longer safely change this value. '''
-    db.set('kubernetes-master.service-cidr', service_cidr())
+    ''' Freeze the service CIDR and Cluster IP. Once the apiserver has
+    started, we can no longer change the Cluster IP. service CIDR can be
+    changed only in the case of CIDR expansion. '''
+
+    # Allow service-cidr change only if it is superset of existing cidr
+    servicecidr = db.get('kubernetes-master.service-cidr')
+    if servicecidr is not None:
+        current_service_cidr = ipaddress.ip_network(servicecidr)
+        new_service_cidr = ipaddress.ip_network(hookenv.config('service-cidr'))
+        if not is_subnet_of(current_service_cidr, new_service_cidr):
+            hookenv.log("New k8s service cidr not superset of old one")
+            return
+
+    db.set('kubernetes-master.service-cidr', hookenv.config('service-cidr'))
+    db.set('kubernetes-master.service-ip', get_kubernetes_service_ip())
 
 
 def maybe_install_kube_proxy():
@@ -772,7 +800,9 @@ def set_final_status():
         return
 
     if hookenv.config('service-cidr') != service_cidr():
-        msg = 'WARN: cannot change service-cidr, still using ' + service_cidr()
+        msg = ('WARN: cannot change service-cidr ',
+               '(only cidr expansion is supported), ',
+               'still using ' + service_cidr())
         hookenv.status_set('active', msg)
         return
 
@@ -1575,7 +1605,8 @@ def on_config_allow_privileged_change():
 @when_any('config.changed.api-extra-args',
           'config.changed.audit-policy',
           'config.changed.audit-webhook-config',
-          'config.changed.enable-keystone-authorization')
+          'config.changed.enable-keystone-authorization',
+          'config.changed.service-cidr')
 @when('kubernetes-master.components.started')
 @when('leadership.set.auto_storage_backend')
 @when('etcd.available')
@@ -1745,6 +1776,11 @@ def get_deprecated_dns_ip():
 
 def get_kubernetes_service_ip():
     '''Get the IP address for the kubernetes service based on the cidr.'''
+    # Return service-ip from DB if available
+    frozen_service_ip = db.get('kubernetes-master.service-ip')
+    if frozen_service_ip is not None:
+        return frozen_service_ip
+
     interface = ipaddress.IPv4Interface(service_cidr())
     # Add .1 at the end of the network
     ip = interface.network.network_address + 1
@@ -1790,6 +1826,7 @@ def configure_apiserver():
         # No point in trying to start master services and fail. Just return.
         return
 
+    freeze_service_cidr()
     api_opts = {}
 
     if is_privileged():

@@ -90,7 +90,9 @@ options:
   service-cidr:
     type: string
     default: 10.152.183.0/24
-    description: CIDR to user for Kubernetes services. Cannot be changed after deployment.
+    description: |
+      CIDR to user for Kubernetes services. Only expansion of service cidr is
+      supported after deployment.
   allow-privileged:
     type: string
     default: "auto"
